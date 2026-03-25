@@ -1,0 +1,29 @@
+# Build artifacts
+build/
+cmake-build-*/
+*.o
+*.a
+*.so
+*.dylib
+**/tickets/
+**/benchmark/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Models (large files)
+*.rkllm
+*.rknn
+*.onnx
+*.bin
+
+# Logs
+*.log

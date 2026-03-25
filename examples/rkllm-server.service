@@ -1,0 +1,19 @@
+[Unit]
+Description=RKLLM HTTP API Server
+After=network.target
+
+[Service]
+Type=simple
+User=maxim
+WorkingDirectory=/home/maxim/EdgeNPU-API
+Environment=LD_LIBRARY_PATH=/home/maxim/EdgeNPU-API/lib/aarch64
+ExecStartPre=/bin/bash -c 'ulimit -n 16384'
+ExecStart=/home/maxim/EdgeNPU-API/build/rkllm-server \
+  --type llm \
+  --llm /home/maxim/models/qwen3-4b-rk3588-w8a8.rkllm \
+  --port 8082
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
