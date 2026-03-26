@@ -240,6 +240,48 @@ int callback(RKLLMResult *result, void *userdata, LLMCallState state) {
     return 0;
 }
 
+/**
+ * Single-pass image preprocessing for RKNN vision encoder.
+ * Performs letterbox resize + BGR→RGB conversion in minimal passes.
+ *
+ * @param input_bgr   Input image in BGR format (OpenCV default)
+ * @param output_rgb  Output buffer, will be resized to target_size×target_size RGB
+ * @param target_size Target dimension (e.g., 224 for 224×224 model)
+ * @param bg_color    Letterbox background color (default: gray 127)
+ *
+ * Old pipeline: cvtColor → expand2square → resize (3 copies)
+ * New pipeline: resize into ROI → cvtColor (1-2 copies)
+ */
+void preprocess_image_optimized(const cv::Mat& input_bgr, cv::Mat& output_rgb,
+                                int target_size,
+                                const cv::Scalar& bg_color = cv::Scalar(127, 127, 127)) {
+    int width = input_bgr.cols;
+    int height = input_bgr.rows;
+
+    // Calculate scale and padding for letterbox
+    float scale = std::min((float)target_size / width, (float)target_size / height);
+    int new_width = std::round(width * scale);
+    int new_height = std::round(height * scale);
+
+    // Ensure dimensions don't exceed target
+    new_width = std::min(new_width, target_size);
+    new_height = std::min(new_height, target_size);
+
+    int x_offset = (target_size - new_width) / 2;
+    int y_offset = (target_size - new_height) / 2;
+
+    // Create output with background color (RGB format)
+    output_rgb = cv::Mat(target_size, target_size, CV_8UC3, bg_color);
+
+    // Resize directly into ROI
+    cv::Rect roi(x_offset, y_offset, new_width, new_height);
+    cv::Mat resized_roi = output_rgb(roi);
+    cv::resize(input_bgr, resized_roi, cv::Size(new_width, new_height), 0, 0, cv::INTER_LINEAR);
+
+    // Convert BGR→RGB in-place on the resized region
+    cv::cvtColor(resized_roi, resized_roi, cv::COLOR_BGR2RGB);
+}
+
 // Expand image to square with background color
 cv::Mat expand2square(const cv::Mat& img, const cv::Scalar& background_color) {
     int width = img.cols;
@@ -335,22 +377,13 @@ string run_vlm_inference(const cv::Mat& input_img, const string& prompt, Inferen
     global_response.token_count = 0;
     global_response.start_time = total_start;
 
-    // === Phase 1: Image preprocessing ===
+    // === Phase 1: Image preprocessing (optimized) ===
     auto preprocess_start = chrono::high_resolution_clock::now();
 
-    // Convert BGR to RGB
-    cv::Mat img;
-    cv::cvtColor(input_img, img, cv::COLOR_BGR2RGB);
-
-    // Expand to square
-    cv::Scalar background_color(127, 127, 127);
-    cv::Mat square_img = expand2square(img, background_color);
-
-    // Resize to model input size
     size_t image_width = rknn_app_ctx.model_width;
     size_t image_height = rknn_app_ctx.model_height;
     cv::Mat resized_img;
-    cv::resize(square_img, resized_img, cv::Size(image_width, image_height), 0, 0, cv::INTER_LINEAR);
+    preprocess_image_optimized(input_img, resized_img, image_width);
 
     auto preprocess_end = chrono::high_resolution_clock::now();
     if (metrics) {
