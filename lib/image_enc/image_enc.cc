@@ -175,8 +175,8 @@ int run_imgenc(rknn_app_context_t* app_ctx, void* img_data, float* out_result)
         }
     }
 
-    // Remeber to release rknn output
-    rknn_outputs_release(app_ctx->rknn_ctx, 1, outputs);
+    // Remember to release rknn output (all n_output buffers!)
+    rknn_outputs_release(app_ctx->rknn_ctx, app_ctx->io_num.n_output, outputs);
 
 out:
 
