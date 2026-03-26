@@ -71,6 +71,104 @@ string format_llama_prompt(const string& user_content) {
            user_content + "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";
 }
 
+// ============================================================================
+// Telemetry System (optional, zero overhead when disabled)
+// ============================================================================
+
+/**
+ * Inference timing and token metrics.
+ * Only populated when telemetry is enabled.
+ */
+struct InferenceMetrics {
+    // Timing (milliseconds)
+    int64_t preprocess_ms = 0;
+    int64_t vision_encoder_ms = 0;
+    int64_t prefill_ms = 0;
+    int64_t decode_ms = 0;
+    int64_t total_ms = 0;
+
+    // Token counts
+    int input_tokens = 0;
+    int output_tokens = 0;
+
+    /**
+     * Calculate decode speed (tokens/sec).
+     * Returns 0.0 if decode_ms is 0.
+     */
+    float decode_tokens_per_sec() const {
+        return decode_ms > 0 ? (output_tokens * 1000.0f / decode_ms) : 0.0f;
+    }
+
+    /**
+     * Serialize to JSON for response output.
+     */
+    json to_json() const {
+        return json{
+            {"preprocess_ms", preprocess_ms},
+            {"vision_encoder_ms", vision_encoder_ms},
+            {"prefill_ms", prefill_ms},
+            {"decode_ms", decode_ms},
+            {"total_ms", total_ms},
+            {"input_tokens", input_tokens},
+            {"output_tokens", output_tokens},
+            {"decode_tokens_per_sec", decode_tokens_per_sec()}
+        };
+    }
+};
+
+/**
+ * Telemetry output destinations (can be combined with bitwise OR).
+ */
+enum class TelemetryOutput : uint8_t {
+    None     = 0,
+    Stdout   = 1 << 0,   // Log to console
+    Response = 1 << 1,   // Include in HTTP response JSON
+};
+
+// Bitwise operators for TelemetryOutput
+inline TelemetryOutput operator|(TelemetryOutput a, TelemetryOutput b) {
+    return static_cast<TelemetryOutput>(static_cast<uint8_t>(a) | static_cast<uint8_t>(b));
+}
+
+inline bool has_telemetry_output(TelemetryOutput config, TelemetryOutput flag) {
+    return (static_cast<uint8_t>(config) & static_cast<uint8_t>(flag)) != 0;
+}
+
+/**
+ * Parse telemetry query parameter.
+ *
+ * Examples:
+ *   "" or "1"          -> Stdout (default for quick debugging)
+ *   "stdout"           -> Stdout only
+ *   "response"         -> Response only
+ *   "stdout,response"  -> Both stdout and response
+ */
+TelemetryOutput parse_telemetry_param(const string& param) {
+    if (param.empty()) return TelemetryOutput::None;
+    if (param == "1") return TelemetryOutput::Stdout;
+
+    TelemetryOutput result = TelemetryOutput::None;
+
+    // Parse comma-separated values
+    stringstream ss(param);
+    string token;
+    while (getline(ss, token, ',')) {
+        // Trim whitespace
+        size_t start = token.find_first_not_of(" \t");
+        size_t end = token.find_last_not_of(" \t");
+        if (start == string::npos) continue;
+        token = token.substr(start, end - start + 1);
+
+        if (token == "stdout") {
+            result = result | TelemetryOutput::Stdout;
+        } else if (token == "response") {
+            result = result | TelemetryOutput::Response;
+        }
+    }
+
+    return result;
+}
+
 // Global state
 LLMHandle llmHandle = nullptr;
 rknn_app_context_t rknn_app_ctx;
@@ -96,6 +194,9 @@ struct ResponseAccumulator {
     string text;
     bool finished;
     bool error;
+    int token_count = 0;
+    chrono::high_resolution_clock::time_point first_token_time;
+    chrono::high_resolution_clock::time_point start_time;
 };
 
 ResponseAccumulator global_response;
@@ -121,7 +222,7 @@ void signal_handler(int signal) {
     exit(signal);
 }
 
-// RKLLM callback - accumulates response text
+// RKLLM callback - accumulates response text and tracks timing
 int callback(RKLLMResult *result, void *userdata, LLMCallState state) {
     if (state == RKLLM_RUN_FINISH) {
         global_response.finished = true;
@@ -129,9 +230,56 @@ int callback(RKLLMResult *result, void *userdata, LLMCallState state) {
         global_response.error = true;
         global_response.finished = true;
     } else if (state == RKLLM_RUN_NORMAL) {
+        // Track first token time (prefill complete)
+        if (global_response.token_count == 0) {
+            global_response.first_token_time = chrono::high_resolution_clock::now();
+        }
         global_response.text += string(result->text);
+        global_response.token_count++;
     }
     return 0;
+}
+
+/**
+ * Single-pass image preprocessing for RKNN vision encoder.
+ * Performs letterbox resize + BGR→RGB conversion in minimal passes.
+ *
+ * @param input_bgr   Input image in BGR format (OpenCV default)
+ * @param output_rgb  Output buffer, will be resized to target_size×target_size RGB
+ * @param target_size Target dimension (e.g., 224 for 224×224 model)
+ * @param bg_color    Letterbox background color (default: gray 127)
+ *
+ * Old pipeline: cvtColor → expand2square → resize (3 copies)
+ * New pipeline: resize into ROI → cvtColor (1-2 copies)
+ */
+void preprocess_image_optimized(const cv::Mat& input_bgr, cv::Mat& output_rgb,
+                                int target_size,
+                                const cv::Scalar& bg_color = cv::Scalar(127, 127, 127)) {
+    int width = input_bgr.cols;
+    int height = input_bgr.rows;
+
+    // Calculate scale and padding for letterbox
+    float scale = std::min((float)target_size / width, (float)target_size / height);
+    int new_width = std::round(width * scale);
+    int new_height = std::round(height * scale);
+
+    // Ensure dimensions don't exceed target
+    new_width = std::min(new_width, target_size);
+    new_height = std::min(new_height, target_size);
+
+    int x_offset = (target_size - new_width) / 2;
+    int y_offset = (target_size - new_height) / 2;
+
+    // Create output with background color (RGB format)
+    output_rgb = cv::Mat(target_size, target_size, CV_8UC3, bg_color);
+
+    // Resize directly into ROI
+    cv::Rect roi(x_offset, y_offset, new_width, new_height);
+    cv::Mat resized_roi = output_rgb(roi);
+    cv::resize(input_bgr, resized_roi, cv::Size(new_width, new_height), 0, 0, cv::INTER_LINEAR);
+
+    // Convert BGR→RGB in-place on the resized region
+    cv::cvtColor(resized_roi, resized_roi, cv::COLOR_BGR2RGB);
 }
 
 // Expand image to square with background color
@@ -218,28 +366,33 @@ string run_llm_inference(const string& prompt) {
     return global_response.text;
 }
 
-// Process image and run VLM inference
-string run_vlm_inference(const cv::Mat& input_img, const string& prompt) {
+// Process image and run VLM inference with optional telemetry
+string run_vlm_inference(const cv::Mat& input_img, const string& prompt, InferenceMetrics* metrics = nullptr) {
+    auto total_start = chrono::high_resolution_clock::now();
+
     // Reset response accumulator
     global_response.text = "";
     global_response.finished = false;
     global_response.error = false;
+    global_response.token_count = 0;
+    global_response.start_time = total_start;
 
-    // Convert BGR to RGB
-    cv::Mat img;
-    cv::cvtColor(input_img, img, cv::COLOR_BGR2RGB);
+    // === Phase 1: Image preprocessing (optimized) ===
+    auto preprocess_start = chrono::high_resolution_clock::now();
 
-    // Expand to square
-    cv::Scalar background_color(127.5, 127.5, 127.5);
-    cv::Mat square_img = expand2square(img, background_color);
-
-    // Resize to model input size
     size_t image_width = rknn_app_ctx.model_width;
     size_t image_height = rknn_app_ctx.model_height;
     cv::Mat resized_img;
-    cv::resize(square_img, resized_img, cv::Size(image_width, image_height), 0, 0, cv::INTER_LINEAR);
+    preprocess_image_optimized(input_img, resized_img, image_width);
 
-    // Run image encoder
+    auto preprocess_end = chrono::high_resolution_clock::now();
+    if (metrics) {
+        metrics->preprocess_ms = chrono::duration_cast<chrono::milliseconds>(preprocess_end - preprocess_start).count();
+    }
+
+    // === Phase 2: Vision encoder ===
+    auto vision_start = chrono::high_resolution_clock::now();
+
     size_t n_image_tokens = rknn_app_ctx.model_image_token;
     size_t image_embed_len = rknn_app_ctx.model_embed_size;
     size_t n_embed_output = rknn_app_ctx.io_num.n_output;
@@ -253,6 +406,15 @@ string run_vlm_inference(const cv::Mat& input_img, const string& prompt) {
         delete[] img_vec;
         return "Error: Image encoding failed";
     }
+
+    auto vision_end = chrono::high_resolution_clock::now();
+    if (metrics) {
+        metrics->vision_encoder_ms = chrono::duration_cast<chrono::milliseconds>(vision_end - vision_start).count();
+        metrics->input_tokens = n_image_tokens;
+    }
+
+    // === Phase 3: LLM inference ===
+    auto llm_start = chrono::high_resolution_clock::now();
 
     // Prepare RKLLM input
     RKLLMInput rkllm_input;
@@ -282,7 +444,25 @@ string run_vlm_inference(const cv::Mat& input_img, const string& prompt) {
     // Run inference
     rkllm_run(llmHandle, &rkllm_input, &rkllm_infer_params, NULL);
 
+    auto llm_end = chrono::high_resolution_clock::now();
+    if (metrics) {
+        metrics->output_tokens = global_response.token_count;
+
+        // Calculate prefill and decode times
+        if (global_response.token_count > 0) {
+            metrics->prefill_ms = chrono::duration_cast<chrono::milliseconds>(
+                global_response.first_token_time - llm_start).count();
+            metrics->decode_ms = chrono::duration_cast<chrono::milliseconds>(
+                llm_end - global_response.first_token_time).count();
+        }
+    }
+
     delete[] img_vec;
+
+    auto total_end = chrono::high_resolution_clock::now();
+    if (metrics) {
+        metrics->total_ms = chrono::duration_cast<chrono::milliseconds>(total_end - total_start).count();
+    }
 
     if (global_response.error) {
         return "Error: Inference failed";
@@ -476,6 +656,11 @@ void setup_routes(httplib::Server& svr) {
             // Run inference with thread safety
             string result;
 
+            // Telemetry support (VLM only)
+            TelemetryOutput telemetry = TelemetryOutput::None;
+            InferenceMetrics metrics;
+            bool metrics_collected = false;
+
             if (config.type == ModelType::LLM) {
                 // Text-only LLM inference
                 lock_guard<mutex> lock(npu_mutex);
@@ -515,15 +700,25 @@ void setup_routes(httplib::Server& svr) {
                     return;
                 }
 
+                // Parse telemetry parameter
+                if (req.has_param("telemetry")) {
+                    telemetry = parse_telemetry_param(req.get_param_value("telemetry"));
+                }
+
+                // Run inference with optional metrics collection
+                InferenceMetrics* metrics_ptr = (telemetry != TelemetryOutput::None) ? &metrics : nullptr;
+
                 lock_guard<mutex> lock(npu_mutex);
-                cout << "[Server] Running VLM inference..." << endl;
-                auto t_start = chrono::high_resolution_clock::now();
+                result = run_vlm_inference(img, user_content, metrics_ptr);
+                metrics_collected = (metrics_ptr != nullptr);
 
-                result = run_vlm_inference(img, user_content);
-
-                auto t_end = chrono::high_resolution_clock::now();
-                auto elapsed = chrono::duration_cast<chrono::milliseconds>(t_end - t_start);
-                cout << "[Server] VLM inference completed in " << elapsed.count() << " ms" << endl;
+                // Output telemetry to stdout if enabled
+                if (metrics_collected && has_telemetry_output(telemetry, TelemetryOutput::Stdout)) {
+                    cout << "[Telemetry] total=" << metrics.total_ms << " ms"
+                         << " (vision=" << metrics.vision_encoder_ms
+                         << ", prefill=" << metrics.prefill_ms
+                         << ", decode=" << metrics.decode_ms << ")" << endl;
+                }
             }
 
             // Format OpenAI response
@@ -548,6 +743,11 @@ void setup_routes(httplib::Server& svr) {
                     {"total_tokens", 0}
                 }}
             };
+
+            // Add telemetry to response if enabled
+            if (metrics_collected && has_telemetry_output(telemetry, TelemetryOutput::Response)) {
+                response["telemetry"] = metrics.to_json();
+            }
 
             res.set_content(response.dump(), "application/json");
 
