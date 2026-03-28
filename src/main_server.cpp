@@ -22,6 +22,7 @@
 #include "httplib.h"
 #include "json.hpp"
 #include "base64.h"
+#include "telemetry.h"
 
 using namespace std;
 using json = nlohmann::json;
@@ -69,104 +70,6 @@ string format_qwen_prompt(const string& user_content) {
 string format_llama_prompt(const string& user_content) {
     return "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n" +
            user_content + "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";
-}
-
-// ============================================================================
-// Telemetry System (optional, zero overhead when disabled)
-// ============================================================================
-
-/**
- * Inference timing and token metrics.
- * Only populated when telemetry is enabled.
- */
-struct InferenceMetrics {
-    // Timing (milliseconds)
-    int64_t preprocess_ms = 0;
-    int64_t vision_encoder_ms = 0;
-    int64_t prefill_ms = 0;
-    int64_t decode_ms = 0;
-    int64_t total_ms = 0;
-
-    // Token counts
-    int input_tokens = 0;
-    int output_tokens = 0;
-
-    /**
-     * Calculate decode speed (tokens/sec).
-     * Returns 0.0 if decode_ms is 0.
-     */
-    float decode_tokens_per_sec() const {
-        return decode_ms > 0 ? (output_tokens * 1000.0f / decode_ms) : 0.0f;
-    }
-
-    /**
-     * Serialize to JSON for response output.
-     */
-    json to_json() const {
-        return json{
-            {"preprocess_ms", preprocess_ms},
-            {"vision_encoder_ms", vision_encoder_ms},
-            {"prefill_ms", prefill_ms},
-            {"decode_ms", decode_ms},
-            {"total_ms", total_ms},
-            {"input_tokens", input_tokens},
-            {"output_tokens", output_tokens},
-            {"decode_tokens_per_sec", decode_tokens_per_sec()}
-        };
-    }
-};
-
-/**
- * Telemetry output destinations (can be combined with bitwise OR).
- */
-enum class TelemetryOutput : uint8_t {
-    None     = 0,
-    Stdout   = 1 << 0,   // Log to console
-    Response = 1 << 1,   // Include in HTTP response JSON
-};
-
-// Bitwise operators for TelemetryOutput
-inline TelemetryOutput operator|(TelemetryOutput a, TelemetryOutput b) {
-    return static_cast<TelemetryOutput>(static_cast<uint8_t>(a) | static_cast<uint8_t>(b));
-}
-
-inline bool has_telemetry_output(TelemetryOutput config, TelemetryOutput flag) {
-    return (static_cast<uint8_t>(config) & static_cast<uint8_t>(flag)) != 0;
-}
-
-/**
- * Parse telemetry query parameter.
- *
- * Examples:
- *   "" or "1"          -> Stdout (default for quick debugging)
- *   "stdout"           -> Stdout only
- *   "response"         -> Response only
- *   "stdout,response"  -> Both stdout and response
- */
-TelemetryOutput parse_telemetry_param(const string& param) {
-    if (param.empty()) return TelemetryOutput::None;
-    if (param == "1") return TelemetryOutput::Stdout;
-
-    TelemetryOutput result = TelemetryOutput::None;
-
-    // Parse comma-separated values
-    stringstream ss(param);
-    string token;
-    while (getline(ss, token, ',')) {
-        // Trim whitespace
-        size_t start = token.find_first_not_of(" \t");
-        size_t end = token.find_last_not_of(" \t");
-        if (start == string::npos) continue;
-        token = token.substr(start, end - start + 1);
-
-        if (token == "stdout") {
-            result = result | TelemetryOutput::Stdout;
-        } else if (token == "response") {
-            result = result | TelemetryOutput::Response;
-        }
-    }
-
-    return result;
 }
 
 // Global state

@@ -1,6 +1,11 @@
 # Build artifacts
 build/
+build_test/
 cmake-build-*/
+
+# Dev notes and Claude config
+dev_notes/
+CLAUDE.md
 *.o
 *.a
 *.so

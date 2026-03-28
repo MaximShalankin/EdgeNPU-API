@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Options
 option(EDGE_NPU_REQUIRE_OPENCV "Fail configure if OpenCV is missing" ON)
+option(BUILD_TESTING "Build unit tests" ON)
 
 # Paths (override with -D or environment)
 set(RKNN_LLM_SDK "" CACHE PATH "Path to rknn-llm SDK root")
@@ -80,3 +81,9 @@ target_link_libraries(rkllm-server
 
 # Install
 install(TARGETS rkllm-server DESTINATION bin)
+
+# Unit tests
+if(BUILD_TESTING)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
