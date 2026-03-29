@@ -231,11 +231,15 @@ bool decode_base64_image(const string& base64_data, cv::Mat& out_image) {
 }
 
 // Run text-only LLM inference (no vision)
-string run_llm_inference(const string& prompt) {
+string run_llm_inference(const string& prompt, InferenceMetrics* metrics = nullptr) {
+    auto total_start = chrono::high_resolution_clock::now();
+
     // Reset response accumulator
     global_response.text = "";
     global_response.finished = false;
     global_response.error = false;
+    global_response.token_count = 0;
+    global_response.start_time = total_start;
 
     // Format prompt according to model family
     string formatted_prompt;
@@ -260,7 +264,26 @@ string run_llm_inference(const string& prompt) {
     rkllm_input.prompt_input = (char*)formatted_prompt.c_str();
 
     // Run inference
+    auto llm_start = chrono::high_resolution_clock::now();
     rkllm_run(llmHandle, &rkllm_input, &rkllm_infer_params, NULL);
+    auto llm_end = chrono::high_resolution_clock::now();
+
+    // Collect metrics if requested
+    if (metrics) {
+        metrics->output_tokens = global_response.token_count;
+        metrics->vision_encoder_ms = 0;
+        metrics->preprocess_ms = 0;
+
+        if (global_response.token_count > 0) {
+            metrics->prefill_ms = chrono::duration_cast<chrono::milliseconds>(
+                global_response.first_token_time - llm_start).count();
+            metrics->decode_ms = chrono::duration_cast<chrono::milliseconds>(
+                llm_end - global_response.first_token_time).count();
+        }
+
+        auto total_end = chrono::high_resolution_clock::now();
+        metrics->total_ms = chrono::duration_cast<chrono::milliseconds>(total_end - total_start).count();
+    }
 
     if (global_response.error) {
         return "Error: Inference failed";
@@ -559,22 +582,32 @@ void setup_routes(httplib::Server& svr) {
             // Run inference with thread safety
             string result;
 
-            // Telemetry support (VLM only)
+            // Telemetry support
             TelemetryOutput telemetry = TelemetryOutput::None;
             InferenceMetrics metrics;
             bool metrics_collected = false;
 
             if (config.type == ModelType::LLM) {
                 // Text-only LLM inference
+                // Parse telemetry parameter
+                if (req.has_param("telemetry")) {
+                    telemetry = parse_telemetry_param(req.get_param_value("telemetry"));
+                }
+
+                InferenceMetrics* metrics_ptr = (telemetry != TelemetryOutput::None) ? &metrics : nullptr;
+
                 lock_guard<mutex> lock(npu_mutex);
                 cout << "[Server] Running LLM inference (text-only)..." << endl;
-                auto t_start = chrono::high_resolution_clock::now();
 
-                result = run_llm_inference(user_content);
+                result = run_llm_inference(user_content, metrics_ptr);
+                metrics_collected = (metrics_ptr != nullptr);
 
-                auto t_end = chrono::high_resolution_clock::now();
-                auto elapsed = chrono::duration_cast<chrono::milliseconds>(t_end - t_start);
-                cout << "[Server] LLM inference completed in " << elapsed.count() << " ms" << endl;
+                if (metrics_collected && has_telemetry_output(telemetry, TelemetryOutput::Stdout)) {
+                    cout << "[Telemetry] total=" << metrics.total_ms << " ms"
+                         << " (prefill=" << metrics.prefill_ms
+                         << ", decode=" << metrics.decode_ms
+                         << ", tokens=" << metrics.output_tokens << ")" << endl;
+                }
             } else {
                 // VLM inference - requires image
                 if (image_data.empty()) {

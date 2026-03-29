@@ -12,6 +12,7 @@ CLAUDE.md
 *.dylib
 **/tickets/
 **/benchmark/
+**/ideas/
 
 # IDE
 .idea/
