@@ -968,10 +968,11 @@ static void mgr_stop_worker() {
         if (ret == g_worker_pid) {
             cout << "[Manager] Worker stopped" << endl;
             g_worker_pid = -1;
-            usleep(500000);  // 500ms CMA release delay
+            usleep(2000000);  // 2s NPU driver release delay
             return;
         }
         if (ret < 0 && errno == ECHILD) {
+            g_worker_died = 0;  // Reaped by SIGCHLD — clear flag
             g_worker_pid = -1;
             return;
         }
@@ -982,11 +983,11 @@ static void mgr_stop_worker() {
     kill(g_worker_pid, SIGKILL);
     waitpid(g_worker_pid, &status, 0);
     g_worker_pid = -1;
-    usleep(500000);  // CMA delay
+    usleep(2000000);  // 2s NPU driver release delay
 }
 
 // Poll Worker /health until ready or timeout
-static bool mgr_wait_for_worker_ready(int w_port, int timeout_sec = 60) {
+static bool mgr_wait_for_worker_ready(int w_port, int timeout_sec = 120) {
     httplib::Client cli("127.0.0.1", w_port);
     cli.set_connection_timeout(1);
     cli.set_read_timeout(1);
@@ -1219,6 +1220,7 @@ int run_manager(int argc, char** argv) {
 
             // Stop old Worker
             mgr_stop_worker();
+            g_worker_died = 0;  // Reset — old Worker's SIGCHLD must not affect new Worker
 
             // Start new Worker
             g_worker_pid = mgr_start_worker(new_cfg, w_port);
