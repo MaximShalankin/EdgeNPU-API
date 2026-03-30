@@ -15,6 +15,14 @@
 #include <sstream>
 #include <vector>
 #include <signal.h>
+#include <atomic>
+#include <cerrno>
+#include <cstring>
+#include <unistd.h>
+#include <sys/wait.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 #include <opencv2/opencv.hpp>
 
 #include "image_enc.h"
@@ -79,6 +87,10 @@ bool models_loaded = false;
 bool vision_loaded = false;
 std::mutex npu_mutex;
 
+// Worker mode flag (set by Manager via --worker-mode)
+bool worker_mode = false;
+int worker_port = 8083;
+
 // Model configuration
 struct ModelConfig {
     string llm_path;
@@ -104,25 +116,26 @@ struct ResponseAccumulator {
 
 ResponseAccumulator global_response;
 
-// Signal handler for graceful shutdown
-void signal_handler(int signal) {
-    cout << "\n[Server] Shutting down..." << endl;
+// ===== Manager global state =====
+static pid_t g_worker_pid = -1;
+static volatile sig_atomic_t g_worker_died = 0;
+static httplib::Server* g_manager_server = nullptr;
+static std::atomic<bool> g_is_loading{false};
 
-    if (models_loaded) {
-        // Release vision encoder only if loaded (VLM mode)
-        if (vision_loaded) {
-            release_imgenc(&rknn_app_ctx);
-            vision_loaded = false;
-        }
-        if (llmHandle != nullptr) {
-            LLMHandle _tmp = llmHandle;
-            llmHandle = nullptr;
-            rkllm_destroy(_tmp);
-        }
-        models_loaded = false;
+// ===== Worker shutdown state =====
+static volatile sig_atomic_t g_worker_shutdown = 0;
+static httplib::Server* g_worker_server = nullptr;
+
+// Worker signal handler — async-signal-safe
+// rkllm_abort() interrupts active rkllm_run(), cleanup happens in main thread
+void worker_signal_handler(int) {
+    g_worker_shutdown = 1;
+    if (llmHandle != nullptr) {
+        rkllm_abort(llmHandle);
     }
-
-    exit(signal);
+    if (g_worker_server) {
+        g_worker_server->stop();
+    }
 }
 
 // RKLLM callback - accumulates response text and tracks timing
@@ -231,11 +244,15 @@ bool decode_base64_image(const string& base64_data, cv::Mat& out_image) {
 }
 
 // Run text-only LLM inference (no vision)
-string run_llm_inference(const string& prompt) {
+string run_llm_inference(const string& prompt, InferenceMetrics* metrics = nullptr) {
+    auto total_start = chrono::high_resolution_clock::now();
+
     // Reset response accumulator
     global_response.text = "";
     global_response.finished = false;
     global_response.error = false;
+    global_response.token_count = 0;
+    global_response.start_time = total_start;
 
     // Format prompt according to model family
     string formatted_prompt;
@@ -260,7 +277,26 @@ string run_llm_inference(const string& prompt) {
     rkllm_input.prompt_input = (char*)formatted_prompt.c_str();
 
     // Run inference
+    auto llm_start = chrono::high_resolution_clock::now();
     rkllm_run(llmHandle, &rkllm_input, &rkllm_infer_params, NULL);
+    auto llm_end = chrono::high_resolution_clock::now();
+
+    // Collect metrics if requested
+    if (metrics) {
+        metrics->output_tokens = global_response.token_count;
+        metrics->vision_encoder_ms = 0;
+        metrics->preprocess_ms = 0;
+
+        if (global_response.token_count > 0) {
+            metrics->prefill_ms = chrono::duration_cast<chrono::milliseconds>(
+                global_response.first_token_time - llm_start).count();
+            metrics->decode_ms = chrono::duration_cast<chrono::milliseconds>(
+                llm_end - global_response.first_token_time).count();
+        }
+
+        auto total_end = chrono::high_resolution_clock::now();
+        metrics->total_ms = chrono::duration_cast<chrono::milliseconds>(total_end - total_start).count();
+    }
 
     if (global_response.error) {
         return "Error: Inference failed";
@@ -559,22 +595,32 @@ void setup_routes(httplib::Server& svr) {
             // Run inference with thread safety
             string result;
 
-            // Telemetry support (VLM only)
+            // Telemetry support
             TelemetryOutput telemetry = TelemetryOutput::None;
             InferenceMetrics metrics;
             bool metrics_collected = false;
 
             if (config.type == ModelType::LLM) {
                 // Text-only LLM inference
+                // Parse telemetry parameter
+                if (req.has_param("telemetry")) {
+                    telemetry = parse_telemetry_param(req.get_param_value("telemetry"));
+                }
+
+                InferenceMetrics* metrics_ptr = (telemetry != TelemetryOutput::None) ? &metrics : nullptr;
+
                 lock_guard<mutex> lock(npu_mutex);
-                cout << "[Server] Running LLM inference (text-only)..." << endl;
-                auto t_start = chrono::high_resolution_clock::now();
+                cout << "[" << (worker_mode ? "Worker" : "Server") << "] Running LLM inference (text-only)..." << endl;
 
-                result = run_llm_inference(user_content);
+                result = run_llm_inference(user_content, metrics_ptr);
+                metrics_collected = (metrics_ptr != nullptr);
 
-                auto t_end = chrono::high_resolution_clock::now();
-                auto elapsed = chrono::duration_cast<chrono::milliseconds>(t_end - t_start);
-                cout << "[Server] LLM inference completed in " << elapsed.count() << " ms" << endl;
+                if (metrics_collected && has_telemetry_output(telemetry, TelemetryOutput::Stdout)) {
+                    cout << "[Telemetry] total=" << metrics.total_ms << " ms"
+                         << " (prefill=" << metrics.prefill_ms
+                         << ", decode=" << metrics.decode_ms
+                         << ", tokens=" << metrics.output_tokens << ")" << endl;
+                }
             } else {
                 // VLM inference - requires image
                 if (image_data.empty()) {
@@ -700,7 +746,7 @@ void print_usage(const char* prog) {
          << "  " << prog << " --type llm --name llama-3.2-1b --prompt-family llama --llm ~/models/llama32-1b.rkllm\n";
 }
 
-int main(int argc, char** argv) {
+int run_worker(int argc, char** argv) {
     // Default configuration
     config.llm_path = string(getenv("HOME")) + "/models/qwen3-vl-4b-instruct_w8a8_rk3588.rkllm";
     config.vision_path = string(getenv("HOME")) + "/models/qwen3-vl_vision_rk3588.rknn";
@@ -712,7 +758,7 @@ int main(int argc, char** argv) {
     config.prompt_family = PromptFamily::QWEN;  // Default to Qwen prompt format
     config.model_name = "qwen3-vl";
 
-    // Parse arguments
+    // Parse arguments (--worker-mode and --worker-port are hidden, not shown in --help)
     for (int i = 1; i < argc; i++) {
         string arg = argv[i];
         if (arg == "--llm" && i + 1 < argc) {
@@ -733,6 +779,10 @@ int main(int argc, char** argv) {
             config.max_context_len = atoi(argv[++i]);
         } else if (arg == "--npu-cores" && i + 1 < argc) {
             config.npu_core_num = atoi(argv[++i]);
+        } else if (arg == "--worker-mode") {
+            worker_mode = true;
+        } else if (arg == "--worker-port" && i + 1 < argc) {
+            worker_port = atoi(argv[++i]);
         } else if (arg == "--help") {
             print_usage(argv[0]);
             return 0;
@@ -743,12 +793,21 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Setup signal handlers
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
+    // Worker: orphan protection — die if parent (Manager) dies
+    if (worker_mode) {
+#ifdef __linux__
+        prctl(PR_SET_PDEATHSIG, SIGTERM);
+#endif
+    }
+
+    // Setup signal handlers (safe: rkllm_abort + server stop, cleanup in main thread)
+    signal(SIGINT, worker_signal_handler);
+    signal(SIGTERM, worker_signal_handler);
+
+    const char* mode_label = worker_mode ? "[Worker]" : "[Standalone]";
 
     cout << "========================================" << endl;
-    cout << "LLM HTTP Server (Persistent Mode)" << endl;
+    cout << mode_label << " LLM HTTP Server" << endl;
     cout << "========================================" << endl;
     cout << "\nConfiguration:" << endl;
     cout << "  Model type: " << model_type_to_string(config.type) << endl;
@@ -761,27 +820,35 @@ int main(int argc, char** argv) {
     cout << "  Port: " << config.port << endl;
     cout << "  Max tokens: " << config.max_new_tokens << endl;
     cout << "  NPU cores: " << config.npu_core_num << endl;
+    if (worker_mode) {
+        cout << "  Worker port: " << worker_port << endl;
+    }
     cout << endl;
 
     // Initialize models
-    cout << "[Init] Loading models..." << endl;
+    cout << mode_label << " Loading models..." << endl;
     auto t_start = chrono::high_resolution_clock::now();
 
     if (!init_models()) {
-        cerr << "[Error] Failed to initialize models" << endl;
+        cerr << mode_label << " Failed to initialize models" << endl;
         return 1;
     }
 
     auto t_end = chrono::high_resolution_clock::now();
     auto total_time = chrono::duration_cast<chrono::milliseconds>(t_end - t_start);
-    cout << "[Init] All models loaded in " << total_time.count() << " ms" << endl;
+    cout << mode_label << " All models loaded in " << total_time.count() << " ms" << endl;
 
     // Setup HTTP server
     httplib::Server svr;
     setup_routes(svr);
+    g_worker_server = &svr;
+
+    // Determine listen address and port
+    const char* listen_host = worker_mode ? "127.0.0.1" : "0.0.0.0";
+    int listen_port = worker_mode ? worker_port : config.port;
 
     cout << "\n========================================" << endl;
-    cout << "Server ready!" << endl;
+    cout << mode_label << " Server ready!" << endl;
     cout << "========================================" << endl;
     cout << "\nEndpoints:" << endl;
     cout << "  GET  /              - Server info" << endl;
@@ -792,13 +859,451 @@ int main(int argc, char** argv) {
     } else {
         cout << "  POST /v1/chat/completions - Chat (text-only)" << endl;
     }
-    cout << "\nStarting HTTP server on port " << config.port << "..." << endl;
+    cout << "\nStarting HTTP server on " << listen_host << ":" << listen_port << "..." << endl;
 
-    // Start server
-    if (!svr.listen("0.0.0.0", config.port)) {
-        cerr << "[Error] Failed to start server on port " << config.port << endl;
+    // Start server (blocks until stopped)
+    if (!svr.listen(listen_host, listen_port)) {
+        cerr << mode_label << " Failed to start server on " << listen_host << ":" << listen_port << endl;
+        g_worker_server = nullptr;
         return 1;
     }
 
+    // Server stopped — cleanup NPU resources in main thread (safe, not in signal handler)
+    cout << mode_label << " Server stopped, cleaning up..." << endl;
+    if (models_loaded) {
+        if (vision_loaded) {
+            release_imgenc(&rknn_app_ctx);
+            vision_loaded = false;
+        }
+        if (llmHandle != nullptr) {
+            LLMHandle tmp = llmHandle;
+            llmHandle = nullptr;
+            rkllm_destroy(tmp);
+        }
+        models_loaded = false;
+    }
+    g_worker_server = nullptr;
+
     return 0;
+}
+
+// ===== Manager Mode =====
+
+// Get path to current executable (for fork+exec)
+static string get_self_exe_path() {
+#ifdef __linux__
+    char buf[4096];
+    ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (len > 0) {
+        buf[len] = '\0';
+        return string(buf);
+    }
+#endif
+    // Fallback (macOS / other)
+    return "rkllm-server";
+}
+
+// Start Worker process via fork+exec
+static pid_t mgr_start_worker(const ModelConfig& cfg, int w_port) {
+    pid_t pid = fork();
+    if (pid < 0) {
+        cerr << "[Manager] fork() failed: " << strerror(errno) << endl;
+        return -1;
+    }
+
+    if (pid == 0) {
+        // Child — become Worker
+        vector<string> args_storage = {
+            "rkllm-server",
+            "--worker-mode",
+            "--llm", cfg.llm_path,
+            "--type", model_type_to_string(cfg.type),
+            "--prompt-family", prompt_family_to_string(cfg.prompt_family),
+            "--name", cfg.model_name,
+            "--max-tokens", to_string(cfg.max_new_tokens),
+            "--context-len", to_string(cfg.max_context_len),
+            "--npu-cores", to_string(cfg.npu_core_num),
+            "--worker-port", to_string(w_port)
+        };
+
+        if (cfg.type == ModelType::VLM) {
+            args_storage.push_back("--vision");
+            args_storage.push_back(cfg.vision_path);
+        }
+
+        vector<char*> args;
+        for (auto& s : args_storage) {
+            args.push_back(const_cast<char*>(s.c_str()));
+        }
+        args.push_back(nullptr);
+
+        execv(get_self_exe_path().c_str(), args.data());
+
+        // execv failed
+        const char msg[] = "[Worker] execv failed\n";
+        write(STDERR_FILENO, msg, sizeof(msg) - 1);
+        _exit(1);
+    }
+
+    return pid;
+}
+
+// Stop Worker process gracefully (SIGTERM → waitpid → SIGKILL fallback)
+static void mgr_stop_worker() {
+    if (g_worker_pid <= 0) return;
+
+    if (g_worker_died) {
+        // Already reaped by SIGCHLD handler
+        g_worker_died = 0;
+        g_worker_pid = -1;
+        return;
+    }
+
+    cout << "[Manager] Stopping Worker (pid=" << g_worker_pid << ")..." << endl;
+    kill(g_worker_pid, SIGTERM);
+
+    int status;
+    for (int i = 0; i < 50; i++) {  // 5 sec timeout
+        pid_t ret = waitpid(g_worker_pid, &status, WNOHANG);
+        if (ret == g_worker_pid) {
+            cout << "[Manager] Worker stopped" << endl;
+            g_worker_pid = -1;
+            usleep(2000000);  // 2s NPU driver release delay
+            return;
+        }
+        if (ret < 0 && errno == ECHILD) {
+            g_worker_died = 0;  // Reaped by SIGCHLD — clear flag
+            g_worker_pid = -1;
+            return;
+        }
+        usleep(100000);  // 100ms
+    }
+
+    cerr << "[Manager] Worker did not stop in 5s, SIGKILL" << endl;
+    kill(g_worker_pid, SIGKILL);
+    waitpid(g_worker_pid, &status, 0);
+    g_worker_pid = -1;
+    usleep(2000000);  // 2s NPU driver release delay
+}
+
+// Poll Worker /health until ready or timeout
+static bool mgr_wait_for_worker_ready(int w_port, int timeout_sec = 120) {
+    httplib::Client cli("127.0.0.1", w_port);
+    cli.set_connection_timeout(1);
+    cli.set_read_timeout(1);
+
+    auto deadline = chrono::steady_clock::now() + chrono::seconds(timeout_sec);
+
+    while (chrono::steady_clock::now() < deadline) {
+        if (g_worker_died) return false;
+        auto res = cli.Get("/health");
+        if (res && res->status == 200) return true;
+        usleep(200000);  // 200ms
+    }
+
+    return false;
+}
+
+// Manager SIGTERM handler
+static void manager_sigterm_handler(int) {
+    const char msg[] = "[Manager] SIGTERM received, shutting down...\n";
+    write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    if (g_manager_server) {
+        g_manager_server->stop();
+    }
+}
+
+// Manager SIGCHLD handler — detect Worker crash
+static void manager_sigchld_handler(int) {
+    int status;
+    pid_t pid;
+    while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+        if (pid == g_worker_pid) {
+            g_worker_died = 1;
+            g_worker_pid = -1;
+        }
+    }
+}
+
+int run_manager(int argc, char** argv) {
+    // Parse args (same model params, Manager-specific port/worker-port)
+    ModelConfig mgr_cfg;
+    mgr_cfg.llm_path = string(getenv("HOME")) + "/models/qwen3-vl-4b-instruct_w8a8_rk3588.rkllm";
+    mgr_cfg.vision_path = string(getenv("HOME")) + "/models/qwen3-vl_vision_rk3588.rknn";
+    mgr_cfg.max_new_tokens = 256;
+    mgr_cfg.max_context_len = 512;
+    mgr_cfg.npu_core_num = 3;
+    mgr_cfg.port = 8082;
+    mgr_cfg.type = ModelType::VLM;
+    mgr_cfg.prompt_family = PromptFamily::QWEN;
+    mgr_cfg.model_name = "qwen3-vl";
+
+    int mgr_port = 8082;
+    int w_port = 8083;
+
+    for (int i = 1; i < argc; i++) {
+        string arg = argv[i];
+        if (arg == "--llm" && i + 1 < argc) mgr_cfg.llm_path = argv[++i];
+        else if (arg == "--vision" && i + 1 < argc) mgr_cfg.vision_path = argv[++i];
+        else if (arg == "--type" && i + 1 < argc) mgr_cfg.type = string_to_model_type(argv[++i]);
+        else if (arg == "--prompt-family" && i + 1 < argc) mgr_cfg.prompt_family = string_to_prompt_family(argv[++i]);
+        else if (arg == "--name" && i + 1 < argc) mgr_cfg.model_name = argv[++i];
+        else if (arg == "--port" && i + 1 < argc) mgr_port = atoi(argv[++i]);
+        else if (arg == "--max-tokens" && i + 1 < argc) mgr_cfg.max_new_tokens = atoi(argv[++i]);
+        else if (arg == "--context-len" && i + 1 < argc) mgr_cfg.max_context_len = atoi(argv[++i]);
+        else if (arg == "--npu-cores" && i + 1 < argc) mgr_cfg.npu_core_num = atoi(argv[++i]);
+        else if (arg == "--worker-port" && i + 1 < argc) w_port = atoi(argv[++i]);
+        else if (arg == "--help") { print_usage(argv[0]); return 0; }
+        else { cerr << "Unknown argument: " << arg << endl; print_usage(argv[0]); return 1; }
+    }
+
+    // Manager signal handlers
+    signal(SIGINT, manager_sigterm_handler);
+    signal(SIGTERM, manager_sigterm_handler);
+    signal(SIGCHLD, manager_sigchld_handler);
+
+    cout << "========================================" << endl;
+    cout << "[Manager] Starting Manager-Worker architecture" << endl;
+    cout << "========================================" << endl;
+    cout << "\nConfiguration:" << endl;
+    cout << "  Model type: " << model_type_to_string(mgr_cfg.type) << endl;
+    cout << "  Model name: " << mgr_cfg.model_name << endl;
+    cout << "  LLM: " << mgr_cfg.llm_path << endl;
+    if (mgr_cfg.type == ModelType::VLM) {
+        cout << "  Vision: " << mgr_cfg.vision_path << endl;
+    }
+    cout << "  Manager port: " << mgr_port << endl;
+    cout << "  Worker port: " << w_port << endl;
+    cout << endl;
+
+    // Start Worker
+    cout << "[Manager] Starting Worker..." << endl;
+    g_worker_pid = mgr_start_worker(mgr_cfg, w_port);
+    if (g_worker_pid < 0) {
+        cerr << "[Manager] Failed to fork Worker" << endl;
+        return 1;
+    }
+    cout << "[Manager] Worker forked (pid=" << g_worker_pid << ")" << endl;
+
+    // Wait for Worker to become ready
+    cout << "[Manager] Waiting for Worker to initialize..." << endl;
+    if (!mgr_wait_for_worker_ready(w_port)) {
+        cerr << "[Manager] Worker failed to start within 60s" << endl;
+        if (g_worker_pid > 0) {
+            kill(g_worker_pid, SIGKILL);
+            int st;
+            waitpid(g_worker_pid, &st, 0);
+        }
+        return 1;
+    }
+    cout << "[Manager] Worker is ready!" << endl;
+
+    // Setup Manager HTTP server (proxy to Worker)
+    httplib::Server svr;
+    g_manager_server = &svr;
+
+    httplib::Client worker_cli("127.0.0.1", w_port);
+    worker_cli.set_read_timeout(120);  // Inference can take 30+ sec
+    worker_cli.set_connection_timeout(5);
+
+    // Proxy: POST /v1/chat/completions (503 during model switch)
+    svr.Post("/v1/chat/completions", [&worker_cli](const httplib::Request& req, httplib::Response& res) {
+        if (g_is_loading.load()) {
+            res.status = 503;
+            res.set_content("{\"error\":{\"message\":\"Model is loading\",\"type\":\"server_error\"}}", "application/json");
+            return;
+        }
+        auto proxy_res = worker_cli.Post(req.target.c_str(), req.body, "application/json");
+        if (!proxy_res) {
+            res.status = 502;
+            res.set_content("{\"error\":{\"message\":\"Worker unavailable\",\"type\":\"server_error\"}}", "application/json");
+            return;
+        }
+        res.status = proxy_res->status;
+        res.set_content(proxy_res->body, proxy_res->get_header_value("Content-Type"));
+    });
+
+    // Proxy: GET /health (always proxy — client checks loading state)
+    svr.Get("/health", [&worker_cli](const httplib::Request&, httplib::Response& res) {
+        if (g_is_loading.load()) {
+            res.set_content("{\"status\":\"loading\",\"model\":\"switching\"}", "application/json");
+            return;
+        }
+        auto proxy_res = worker_cli.Get("/health");
+        if (!proxy_res) {
+            res.status = 502;
+            res.set_content("{\"status\":\"unhealthy\",\"error\":\"Worker unavailable\"}", "application/json");
+            return;
+        }
+        res.status = proxy_res->status;
+        res.set_content(proxy_res->body, proxy_res->get_header_value("Content-Type"));
+    });
+
+    // Proxy: GET /
+    svr.Get("/", [&worker_cli](const httplib::Request&, httplib::Response& res) {
+        auto proxy_res = worker_cli.Get("/");
+        if (!proxy_res) {
+            res.status = 502;
+            res.set_content("{\"error\":{\"message\":\"Worker unavailable\"}}", "application/json");
+            return;
+        }
+        res.status = proxy_res->status;
+        res.set_content(proxy_res->body, proxy_res->get_header_value("Content-Type"));
+    });
+
+    // Proxy: GET /v1/models
+    svr.Get("/v1/models", [&worker_cli](const httplib::Request&, httplib::Response& res) {
+        if (g_is_loading.load()) {
+            res.status = 503;
+            res.set_content("{\"error\":{\"message\":\"Model is loading\",\"type\":\"server_error\"}}", "application/json");
+            return;
+        }
+        auto proxy_res = worker_cli.Get("/v1/models");
+        if (!proxy_res) {
+            res.status = 502;
+            res.set_content("{\"error\":{\"message\":\"Worker unavailable\"}}", "application/json");
+            return;
+        }
+        res.status = proxy_res->status;
+        res.set_content(proxy_res->body, proxy_res->get_header_value("Content-Type"));
+    });
+
+    // Proxy: GET /v1/models/{id}
+    svr.Get(R"(/v1/models/(.+))", [&worker_cli](const httplib::Request& req, httplib::Response& res) {
+        string target = "/v1/models/" + string(req.matches[1]);
+        auto proxy_res = worker_cli.Get(target);
+        if (!proxy_res) {
+            res.status = 502;
+            res.set_content("{\"error\":{\"message\":\"Worker unavailable\"}}", "application/json");
+            return;
+        }
+        res.status = proxy_res->status;
+        res.set_content(proxy_res->body, proxy_res->get_header_value("Content-Type"));
+    });
+
+    // Model switch: POST /v1/models/switch
+    svr.Post("/v1/models/switch", [&mgr_cfg, w_port](const httplib::Request& req, httplib::Response& res) {
+        // Double-switch protection (atomic compare_exchange)
+        bool expected = false;
+        if (!g_is_loading.compare_exchange_strong(expected, true)) {
+            res.status = 409;
+            res.set_content("{\"error\":{\"message\":\"Model switch already in progress\",\"type\":\"conflict\"}}", "application/json");
+            return;
+        }
+
+        try {
+            json body = json::parse(req.body);
+
+            if (!body.contains("llm_path")) {
+                res.status = 400;
+                res.set_content("{\"error\":{\"message\":\"llm_path is required\",\"type\":\"invalid_request_error\"}}", "application/json");
+                g_is_loading = false;
+                return;
+            }
+
+            // Build new config from request, preserve defaults
+            ModelConfig new_cfg;
+            new_cfg.llm_path = body["llm_path"].get<string>();
+            new_cfg.vision_path = body.value("vision_path", mgr_cfg.vision_path);
+            new_cfg.type = string_to_model_type(body.value("type", model_type_to_string(mgr_cfg.type)));
+            new_cfg.prompt_family = string_to_prompt_family(body.value("prompt_family", prompt_family_to_string(mgr_cfg.prompt_family)));
+            new_cfg.model_name = body.value("name", mgr_cfg.model_name);
+            new_cfg.max_new_tokens = body.value("max_tokens", mgr_cfg.max_new_tokens);
+            new_cfg.max_context_len = body.value("context_len", mgr_cfg.max_context_len);
+            new_cfg.npu_core_num = mgr_cfg.npu_core_num;
+            new_cfg.port = mgr_cfg.port;
+
+            cout << "[Manager] Switching to: " << new_cfg.model_name
+                 << " (type=" << model_type_to_string(new_cfg.type) << ")" << endl;
+
+            auto switch_start = chrono::steady_clock::now();
+
+            // Stop old Worker
+            mgr_stop_worker();
+            g_worker_died = 0;  // Reset — old Worker's SIGCHLD must not affect new Worker
+
+            // Start new Worker
+            g_worker_pid = mgr_start_worker(new_cfg, w_port);
+            if (g_worker_pid < 0) {
+                cerr << "[Manager] Failed to start new Worker" << endl;
+                res.status = 500;
+                res.set_content("{\"error\":{\"message\":\"Failed to start Worker\",\"type\":\"server_error\"}}", "application/json");
+                g_is_loading = false;
+                return;
+            }
+
+            // Wait for Worker to become ready (60s timeout)
+            if (!mgr_wait_for_worker_ready(w_port)) {
+                cerr << "[Manager] New Worker failed to start within timeout" << endl;
+                res.status = 500;
+                res.set_content("{\"error\":{\"message\":\"Worker failed to start within timeout\",\"type\":\"server_error\"}}", "application/json");
+                if (g_worker_pid > 0) {
+                    kill(g_worker_pid, SIGKILL);
+                    int st;
+                    waitpid(g_worker_pid, &st, 0);
+                    g_worker_pid = -1;
+                }
+                g_is_loading = false;
+                return;
+            }
+
+            // Success — update Manager's config
+            mgr_cfg = new_cfg;
+            g_is_loading = false;
+
+            auto switch_end = chrono::steady_clock::now();
+            auto switch_ms = chrono::duration_cast<chrono::milliseconds>(switch_end - switch_start).count();
+
+            cout << "[Manager] Switch complete in " << switch_ms << " ms" << endl;
+
+            json response = {
+                {"status", "ok"},
+                {"model", new_cfg.model_name},
+                {"type", model_type_to_string(new_cfg.type)},
+                {"switch_time_ms", switch_ms}
+            };
+            res.set_content(response.dump(), "application/json");
+
+        } catch (const json::exception& e) {
+            res.status = 400;
+            res.set_content("{\"error\":{\"message\":\"Invalid JSON\",\"type\":\"invalid_request_error\"}}", "application/json");
+            g_is_loading = false;
+        }
+    });
+
+    cout << "\n========================================" << endl;
+    cout << "[Manager] Ready!" << endl;
+    cout << "========================================" << endl;
+    cout << "\nManager listening on 0.0.0.0:" << mgr_port << " → Worker on 127.0.0.1:" << w_port << endl;
+
+    if (!svr.listen("0.0.0.0", mgr_port)) {
+        cerr << "[Manager] Failed to listen on port " << mgr_port << endl;
+        mgr_stop_worker();
+        g_manager_server = nullptr;
+        return 1;
+    }
+
+    // Server stopped — clean up
+    cout << "[Manager] Shutting down..." << endl;
+    mgr_stop_worker();
+    g_manager_server = nullptr;
+
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    // Check --worker-mode early for dispatch
+    bool is_worker = false;
+    for (int i = 1; i < argc; i++) {
+        if (string(argv[i]) == "--worker-mode") {
+            is_worker = true;
+            break;
+        }
+    }
+
+    if (is_worker) {
+        return run_worker(argc, argv);
+    } else {
+        return run_manager(argc, argv);
+    }
 }
